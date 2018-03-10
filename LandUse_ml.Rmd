@@ -1,0 +1,413 @@
+---
+title: "STAT577_final_project"
+author: "Brandon Bagley, Donghee Koh"
+output:
+  html_document: default
+---
+
+Brining data and necessary libraries
+```{r setup, include=F, message=F, echo=T}
+library(raster)
+library(ggplot2)
+library(randomForest)
+library(rpart)
+library(e1071)
+library(ggthemes)
+
+udf_acc <- function(data, pred, print = T){
+  table <- table(observed = data, predicted = pred)
+  accuracy <- sum(diag(table)/sum(table))
+  precision <- diag(table)/colSums(table)
+  recall <- diag(table)/rowSums(table)
+  if(print) {
+    print(table)
+    cat('\n',
+        "Accuracy = ", accuracy, '\n',
+        '\t', "Precision", '\n')
+    print(precision)
+    cat('\n', '\t', "Recall", '\n')
+    print(recall)
+  }
+  result <- list(table=table, accuracy=accuracy, precision=precision, recall=recall)
+}
+```
+
+Multiple images were obtained from [Earth Explorer](https://earthexplorer.usgs.gov)Importing LANDSAT_4/5 7-band images of Knoxville, TN obtained from two months in 2017 with low cloud cover.  Information about the 7 spectral bands from the sattelite can be found on the [landsat website](https://landsat.usgs.gov/what-are-band-designations-landsat-satellites).
+```{r tiff_import}
+feb <- brick(x='feb_small.tif')
+names(feb) <- c("band1", "band2","band3","band4","band5","band6","band7")
+jul <- brick(x='jul_small.tif')
+names(jul) <- paste("jul", 1:7, sep=".")
+plotRGB(feb, 3, 2, 1, stretch="lin")
+```
+
+# Exploratory Data visualization
+The 7 bands of the image range from intensity values `r min(minValue(feb))` to `r max(maxValue(feb))`, histograms of each band by intensity value and plotted values are below.
+
+### Histogram of pixel value (intensity) by band
+```{r hist_band, include = T}
+hist(feb, maxpixels=ncell(feb))
+```
+
+### Intensity by image band
+```{r intensity by band, echo=F}
+plot(feb)
+```
+
+# Creating Training Regions
+The aim of the project is to use machine learning techniques to classify land use types from the images.  Training regions were selected from the images that represented 4 different land cover types:
+1. Urban
+2. Forest
+3. Cropland
+4. Water
+
+The number of land uses were selected based on the initial unsupervised clustering, and historic land use classification types.  From the 4 land use types selected, training regions of the image were selected that were representative of the land use.  In the absence of ground truthing these regions, areas were selected that represent archetypal urban, forested, crop, or water areas. 
+
+```{r create training regions, include = F, echo = F, eval=FALSE}
+# Interactive zooming in. Plotting band3 of feb (example)
+newextent <- zoom(feb[[3]]) 
+plotRGB(feb, r=3, g=2, b=1, ext=newextent, stretch='lin')
+forest6 <- drawPoly()
+
+urb1 <- drawPoly(sp=TRUE, col='red', lwd=2)
+urb2 <- drawPoly(sp=TRUE, col='red', lwd=2)
+urb3 <- drawPoly(sp=TRUE, col='red', lwd=2)
+urb4 <- drawPoly(sp=TRUE, col='red', lwd=2)
+forest1 <- drawPoly(sp=TRUE, col='red', lwd=2)
+forest2 <- drawPoly(sp=TRUE, col='red', lwd=2)
+crop1 <- drawPoly(sp=TRUE, col='red', lwd=2)
+crop2 <- drawPoly(sp=TRUE, col='red', lwd=2)
+crop3 <- drawPoly(sp=TRUE, col='red', lwd=2)
+water1 <- drawPoly(sp=TRUE, col='red', lwd=2)
+water2 <- drawPoly(sp=TRUE, col='red', lwd=2) #portion of TN river
+water3 <- drawPoly(sp=TRUE, col='red', lwd=2) #Douglas lake
+save(urb1, urb2, urb3, urb4, forest1, forest2, crop1, crop2, crop3,
+     water1, water2, water3, file = 'train_dh_poly.Rdata')
+```
+
+# Training regions
+```{r plot_training}
+load("train_dh_poly.Rdata")
+plys <- c(paste0("urb", seq(1,4)),
+          paste0("forest", seq(1,2)),
+          paste0("crop", seq(1,3)),
+          paste0("water", seq(1,3)))
+
+plotRGB(feb, 3, 2, 1, stretch="lin")
+for (i in plys){
+  plot(get(i), add = T, density = 90, col = "gray", lwd = 2,
+       border = ifelse(grepl("urb", i),
+                       "black",
+                       ifelse(grepl("forest", i),
+                              "green",
+                              ifelse(grepl("crop", i),
+                                     "orange",
+                                     ifelse(grepl("water", i),
+                                            "blue",
+                                            "gray"))))
+  )
+}
+```
+
+# Create the training dataset
+Extract the individual cells by location index from the image and label them accordingly.  These cells will serve as the training dataset.
+```{r training_dataset}
+lsat.labels <- rep(NA, ncell(feb))
+# Extracting indexed cells from the training regions and label accordingly
+for (i in seq(1,4)){lsat.labels[unlist(cellFromPolygon(feb,get(paste0("urb", i))))] <- "Urban"}
+for (i in seq(1,2)){lsat.labels[unlist(cellFromPolygon(feb,get(paste0("forest", i))))] <- "Forest"}
+for (i in seq(1,3)){lsat.labels[unlist(cellFromPolygon(feb,get(paste0("crop", i))))] <- "Cropland"}
+for (i in seq(1,3)){lsat.labels[unlist(cellFromPolygon(feb,get(paste0("water", i))))] <- "Water"}
+# lsat.labels[unlist(cellFromPolygon(feb,urb1))] <- "urban"
+
+#Computing NDVI and convert to scale of response
+ndvi <- overlay(feb$band3, feb$band4, fun=function(x,y){
+  ((((y-x)/(x+y)) + 1)/2)*250
+  })
+ndvi[is.na(ndvi)] <- 1
+
+covs <- addLayer(feb, ndvi) #combining feb layers and ndvi
+names(covs) <- c("band1", "band2","band3","band4","band5","band6","band7","NDVI")
+
+#Get a list of which rows are training data
+train.ids <- (!is.na(lsat.labels)) 
+
+# Create training and test datasets
+all.data <- data.frame(labels=as.factor(lsat.labels), data.matrix(values(covs)))
+tr_subset <- subset
+# 80/20 split of training data for validation
+smp_size = floor(.8 * nrow(tr_subset))
+tr_sample <- sample(seq_len(nrow(tr_subset)), size = smp_size, replace=F)
+tr_train <- tr_subset[tr_sample,]
+tr_validate <- tr_subset[-tr_sample,]
+#
+# print(nrow(tr_subset))
+# print(nrow(tr_train))
+# print(nrow(tr_validate))
+
+# Subsetting training data by each class
+mylist <- split(tr_subset, tr_subset$labels) 
+val_crop <- mylist$Cropland
+val_urb <- mylist$Urban
+val_forest <- mylist$Forest
+val_water <- mylist$Water
+```
+
+# Create NDVI
+The Normalized Difference Vegetative Index(NDVI) is used to differentiate between vegetation senesence and types using Near IR and Visible spectrum of reflected light.  The inclusion of NDVI may be helpful in identifyng between cropland or forested areas, and other land use types.  
+
+NDVI is calculated as $\frac{NIR-Vis}{NIR+Vis}$ where the Near-IR spectra (0.4 to 0.7 µm) are band 3, and the red spectrum of visible light (0.4 to 0.7 µm) is band 4.  Normally NDVI is a range from -1 to 1, but the NDVI values were scaled from 1 to 250 to match the intensity of the other bands.
+
+```{r band3-4_scatter}
+#Scatter plot using band3 and 4 
+ggplot(data=subset(all.data, train.ids)) +
+  geom_point(aes(x=band3, y=band4, color=labels), size=1, alpha=0.5) +
+  labs(title = "Landsat Band values near Knoxville, TN By Land Use",
+       subtitle = "Red (band 3) and Near-IR (band 4)") +
+  guides(color=guide_legend(override.aes = list(size=3, alpha=1),
+                            title = "Land Use")) +
+  theme_light()
+```
+
+# Plotting NDVI
+```{r NDVI_map, echo=F}
+par(mfrow=c(1,1))
+plot(ndvi, main="NDVI")
+```
+
+#Visualizing the distribution of data for each class
+```{r ndvi_density}
+ggplot(data=tr_subset, aes(x=NDVI, fill = labels)) +
+  geom_density(alpha= .3)+
+  geom_rug(aes(x=NDVI, y=0), position = position_jitter(height = 0),
+           alpha = .2)+
+  theme_base(base_size = 11) +
+  guides(fill=guide_legend(title = "Land Use")) +
+  labs(title = "NDVI surrounding Knoxville By Land Use",
+      subtitle = "Density Plot Of Training Data Set",
+      y = "Frequency")
+```
+
+A commonly used used metric for assessing vegetation dynamics, the normalized difference vegetation index (_NDVI_),can be computed from Landsat bands3(visible red) and 4(near infra-red). Since this layer can be of a value in classifying different landcover types (particularly anything with vegetation), NDVI layer will also be used as a covarite for the anlaysis. 
+
+As can be observed from the plots produced above, the forest, urban and water categories are well separable while cropland has some confusion with urban area. But I think this may be attributable to not-good-enough training procedure.If we train the data using higher resolution image with higher precision (and possibly with more detailed categories), we can possibly enhance this problem by significant amount. Furthermore I have only used feb image for training
+For better classification,we might consider integrating jul, dec, or other combined (e.g. pca layers) layers. Or we could consider incorporatong Census demographic data.
+
+## Random Forest
+```{r rf_var_imp, eval=F}
+# Cross Validated model to determine the number of variables
+rf_cv <- rfcv(trainx=tr_subset[,c(2:9)], trainy=tr_subset$labels, ntree=200,
+               cv.fold = 5, step = 0.8)
+
+#Plot variables by importance
+with(rf_cv, plot(n.var, error.cv))
+```
+
+```{r rf_model, warning=F, results='hide'}
+# RF Model
+modelRF <- randomForest(x=tr_train[,c(2:9)], y=tr_train$labels, ntree=500 
+                        ,mtry=3 ,importance=TRUE)
+
+rfimp <- importance(modelRF)
+rfvar <- rownames(rfimp)[order(rfimp[,1], decreasing = T)]
+
+# Predict the land cover types by using validatino set and training set
+validateRF <- predict(modelRF, tr_validate)
+val_rf_st <- udf_acc(tr_validate$labels, validateRF, print = F)
+
+oobRF <- predict(modelRF)
+oob_rf_st <- udf_acc(tr_train$labels, oobRF, print = F)
+
+# Predict land cover by using all data
+predRF <- predict(covs, model=modelRF, na.rm=TRUE)
+```
+
+A random forest model was evaluated first due to it's ease of interpretation, and accuracy of variable importance.  The model was used with all variables first and had an out-of-the-bag error rate of `r round(100*mean(modelRF$err.rate),2)` had and overall accuracy of `r round(100*(sum(diag(modelRF$confusion))/sum(colSums(modelRF$confusion)[1:4])),2)`% using 500 trees and using only 3 variables per tree.  The confusion matrix and variable importance were calculated, in addition to the accuracy, precision, and recall for both OOB and the verification of the training set (80% training, 20% validation).  The accuracy of the training set was `r round(100*oob_rf_st$accuracy, 2)`% and the accuracy of the validation data was `round(100*val_rf_st$accuracy, 2)`%.  The average precision for all land use types are `r round(100*mean(oob_rf_st$precision), 2)`% for OOB and `r round(100*mean(val_rf_st$precision), 2)`% for the validation set with the lowest precision being `r names(oob_rf_st$precision)[which.min(oob_rf_st$precision)]` for OOB and validation prediction.
+
+```{r rf_confusion, echo = F}
+cat("Random Forest Confusion Matrix\n")
+modelRF$confusion
+```
+
+```{r rf_prodacc, echo=F}
+# Random Forest producer's accuracy
+cat("Random Forest Producer's Accuracy\n")
+diag(sweep(modelRF$confusion, 2, colSums(modelRF$confusion), "/"))
+
+# Random Forest User's accuracy
+cat("\nRandom Forest User's Accuracy\n")
+diag(sweep(modelRF$confusion, 1, rowSums(modelRF$confusion),"/"))
+
+```
+```{r rf_varimp, echo=F}
+#variable importance 
+varImpPlot(modelRF)
+```
+
+
+Variable importance plots for a random forest model showing mean decrease in accuracy and the decrease in Gini impurity Coefficient (right) for each variable
+In our case, it seems that band1 and NDVI have the highest impact on model accuracy, while band1 and 2 score highest with the Gini impurity criterion. 
+For large dataset like ours, it may be also helpful to know this imformation,
+and leave out less important variables for subsequent run to enhance classification accuracy rate.  Using all of the variables, a plot of the predicted land use classifications are plotted below.
+
+
+# Plot the predicted land cover class
+```{r rf_plot}
+cols <- c("orange", "green", "grey", "blue")
+#dev.off()
+par(mfrow=c(1,1))
+plot(predRF, col=cols, legend=FALSE, main="Random Forest Predicted Land Use")
+legend("bottomright", legend=c("cropland","forest", "urban","water"),
+       fill=cols, bg="white")
+```
+
+## Bagging Classification
+```{r bagging_model}
+modelBag <- randomForest(x=tr_subset[,c(2:9)], y=tr_subset$labels, ntree=500 
+                        ,mtry=8 ,importance=TRUE)
+predBag <- predict(covs, model=modelBag, na.rm=TRUE)
+
+plot(predBag, col=cols, legend=FALSE, main="Bagging")
+legend("bottomright", legend=c("cropland","forest", "urban","water"),
+       fill=cols, bg="white")
+modelBag$confusion
+varImpPlot(modelBag)
+
+# producer's accuracy
+diag(sweep(modelBag$confusion, 2, colSums(modelBag$confusion), "/"))
+
+# User's accuracy
+diag(sweep(modelBag$confusion, 1, rowSums(modelBag$confusion),"/"))
+```
+
+Regression Tree 
+```{r regressiontree_model}
+modelTree <- rpart(labels~.,data=tr_subset, method="class")
+plot(modelTree, margin=0.05)
+text(modelTree, use.n=TRUE, cex=0.8, pretty=0)
+predTree <- predict(modelTree, all.data, type="class")
+tree.map <- raster(feb)
+values(tree.map) <- predTree
+cols <- c("orange", "green", "grey", "blue")
+plot(tree.map, col=cols, legend=FALSE, main="Regression Tree")
+legend("bottomright", legend=c("cropland","forest", "urban","water"),
+       fill=cols, bg="white")
+conf.mat <- table(pred=predTree[train.ids], train=all.data[train.ids, "labels"])
+conf.mat
+
+# producer's accuracy
+diag(sweep(conf.mat, 2, colSums(conf.mat), "/"))
+
+# User's accuracy
+diag(sweep(conf.mat, 1, rowSums(conf.mat),"/")) 
+
+```
+
+Logistic Regression Classifier
+```{r logreg_model}
+#Do a logistic regression for each class
+classes <- levels(all.data$labels)
+C <- length(classes)
+logit.class <- as.data.frame(matrix(NA, nrow(all.data), C))
+names(logit.class) <- classes
+
+#We will first fit the model for each class (vs. all the other classes)
+#and then we will save the predicted probalility of being in that class
+for(c in classes){
+  model.fit <- glm(I(labels==c)~., data=tr_subset, family="binomial")
+  logit.class[[c]] <- as.vector(predict(model.fit, newdata=all.data[,-1],#all.data1[,-1],
+                                        type="response"))
+}
+pred.logit <- apply(logit.class, 1, function(x) which(x==max(x)))
+logit.map <- raster(jul) #initialize a map. we will overite the values
+pred.logit <- factor(pred.logit, levels=1:4, labels=classes)
+values(logit.map) <- pred.logit
+plot(logit.map, col=cols, legend=FALSE, main="Logistic Regression")
+legend("bottomright", legend=c("cropland","forest", "urban","water"),
+       fill=cols, bg="white")
+
+#confusion matrix for logistic regression 
+logit.conf.mat <-table(pred=pred.logit[train.ids], train=all.data[train.ids, "labels"])#all.data1[train.ids, "labels"])
+logit.conf.mat
+
+#Producer's accuracy
+sweep(logit.conf.mat, 2, colSums(conf.mat), "/")
+#User's accuracy
+sweep(logit.conf.mat, 1, rowSums(conf.mat), "/")
+```
+
+Suppot Vector Machine
+```{r svm, eval=F}
+# This takes a while: subset the training ids by only keeping 1/10 of them.
+train2.ids <- rep(FALSE, ncell(jul))
+train2.ids[seq(from = 1, to = ncell(jul), by = 10)] <- train.ids[seq(from = 1, 
+                                                                     to = ncell(jul), by = 10)]
+
+# Train and classify
+fit.svm <- svm(labels ~ ., data = all.data, subset = train2.ids, kernel = "linear")
+pred.svm <- predict(fit.svm, newdata = all.data[, -1])
+
+
+svm.map <- raster(jul)  # Initialize a map.  We will overwrite the values
+# Their are some incomplete cases in all.data, and pred.svm is shorter than
+# all.data
+values(svm.map)[complete.cases(all.data[, -1])] <- pred.svm
+plot(svm.map, col = cols, legend=FALSE,main = "SVM")
+legend("bottomright", legend=c("cropland","forest", "urban","water"),
+       fill=cols, bg="white")
+
+#Confusion matrix
+conf.mat.svm <- table(pred = pred.logit[train.ids], train = all.data[train.ids, 
+                                                                 "labels"])
+# producer's accuracy
+diag(sweep(conf.mat.svm, 2, colSums(conf.mat), "/"))
+# User's accuracy
+diag(sweep(conf.mat.svm, 1, rowSums(conf.mat.svm),"/"))
+```
+
+K-means Cluster
+```{r Kmeans_cluster, eval = F}
+valuetable <- getValues(covs)
+head(valuetable)
+km <- kmeans(na.omit(valuetable), center=3, iter.max=100, nstart=20)
+
+##Create a blank raster with default values of 0
+rNA <- setValues(raster(covs),0)
+##Loop through layers of covs
+##Assign a 1 to rNA wherever an NA is encountered in covs. 
+for(i in 1:nlayers(covs)){
+  rNA[is.na(covs[[i]])] <- 1
+}
+##convert rNA to an integer vector
+rNA <- getValues(rNA)
+
+##Convert valuetable to a data.frame
+valuetable <- as.data.frame(valuetable)
+##if rNA is 0, assign the cluster value at that position
+valuetable$class[rNA==0] <- km$cluster
+valuetable$class[rNA==1] <-NA
+
+##Create a blank raster
+classes <- raster(covs)
+##Assign values from the 'class' column of valuetable
+classes <- setValues(classes, valuetable$class)
+plot(classes, legend=FALSE, col=cols, main="K-means")
+```
+
+The producer's accuracy is read by reading down columns. The producer sees training data, and wants know how they are reproduced. 
+
+The user's accuracy is read by readong along rows. The user sees a predicted map value, and wants to know how likely is to be the truth. 
+
+As we have foresaw at the exploratory visual anlaysis stage, there is a notable confusion between the urban and cropland categories.In addition. If we carefully compare our resulting images to actual satellite (google aerial phtography) image, we can eaily find that a significant portion of low density urban areas (e.g. suburban area) are classified either as forest or cropland. This is because we did not includ the suburban categories at the training stage. If we included and trained accordingly, we would be able to identify those features as well
+resulting in better classification.
+In terms of user/producer's accuracy, all but svm show same defree of performance. Based on this, our future discussion need to focus on why certain methods perform better than others and under what circumstances they are better,etc. 
+
+However, in general,the supervised classification methods always out-perform unsupervised methods like k-means clustering.
+
+As a final remark, there are several ways we could improve our results
+
+1) Do a better job at training stage (include more training region) in such a way that various forms of each category are well accomodated for training set.
+(e.g. high density urban area, low density urban area, evergreen forest, deciduous forest, etc)
+
+2) Consider incorporating other covariates such as population data for distinguishing suburbs from cropland or forest. By no menas are we able to  perfectly represent the satellite images on land cover classification. Depending on the purpose of one's research, certain features should be selectively chosen at the expense of others. However, when we do that, we need to pre-plan and think hard what features can represent well for the aprticular classes that we are interested in.  
+
